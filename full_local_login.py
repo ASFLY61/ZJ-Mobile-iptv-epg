@@ -358,6 +358,37 @@ def load_channels():
     return chans
 
 
+def channel_info(channel_id):
+    """从 channel_ids.json 查频道信息 {name, group, mediaID, no}; 找不到返回 {}"""
+    try:
+        with open(CHANNELS_JSON, encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("by_id", {}).get(str(channel_id), {})
+    except Exception:
+        return {}
+
+
+def resolve_channel_id(user_input):
+    """把用户输入解析成 (channelID, info)。
+    - 输入是 channelID (by_id 的 key) -> 直接用
+    - 输入是 mediaID (某频道的 mediaID 字段) -> 映射回对应 channelID
+    返回 (channel_id, info_dict)"""
+    s = str(user_input)
+    info = channel_info(s)
+    if info:
+        return s, info
+    # 不是 channelID, 试按 mediaID 找
+    try:
+        with open(CHANNELS_JSON, encoding="utf-8") as f:
+            by_id = json.load(f).get("by_id", {})
+        for cid, v in by_id.items():
+            if str(v.get("mediaID", "")) == s:
+                return cid, v
+    except Exception:
+        pass
+    return s, {}
+
+
 CSV_HEADERS = ["分组", "频道号", "频道ID", "频道", "开始", "结束", "节目", "节目ID"]
 
 
@@ -450,21 +481,25 @@ def day_note(progs, mode="catchup"):
 
 
 def run_single(jsid, token, port, channel_id, day, mode="catchup"):
-    """单频道: 打印完整列表 + 存 JSON/文本"""
-    code, body2 = query_playbill(jsid, token, port, channel_id, day, mode=mode)
+    """单频道: 打印完整列表 + 存 JSON/文本 (频道显示真实名称, 支持 mediaID 输入)"""
+    cid, info = resolve_channel_id(channel_id)
+    cname = info.get("name", channel_id)
+    cmedia = info.get("mediaID", "")
+    code, body2 = query_playbill(jsid, token, port, cid, day, mode=mode)
     try:
         data = json.loads(body2.decode("utf-8", "replace"))
         res = data.get("result", {})
         progs = parse_playbill(data)
         print(f"[✓] retCode={res.get('retCode')} {res.get('retMsg')}  节目数={len(progs)}")
         print("\n" + "=" * 56)
-        print(f" 节目单  频道={channel_id}  日期={day}  共{len(progs)}条  [{mode}]")
+        extra = f", mediaID={cmedia}" if cmedia else ""
+        print(f" 节目单  频道={cname}  (channelID={cid}{extra})  日期={day}  共{len(progs)}条  [{mode}]")
         print("=" * 56)
         for i, p in enumerate(progs, 1):
             print(f"{i:3d}. {p['start']} - {p['end']}  {p['name']}")
         day_note(progs, mode)
         if progs:
-            jp, tp = save_playbill(progs, channel_id, day, res.get("retCode"))
+            jp, tp = save_playbill(progs, cid, day, res.get("retCode"))
             print("\n[✓] 已保存完整节目列表:")
             print(f"    JSON: {jp}")
             print(f"    文本: {tp}")
