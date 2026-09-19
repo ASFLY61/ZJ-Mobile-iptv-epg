@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  self-check:
+    name: Python 编译 + 离线自检
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: 语法检查 (py_compile 全部 .py)
+        run: python -m py_compile full_local_login.py verify_digest.py probe_days.py extract_base.py
+
+      - name: 导入检查 (模块可导入, 无导入期副作用)
+        run: |
+          python - <<'PY'
+          import importlib.util
+          for f in ["full_local_login.py", "verify_digest.py", "extract_base.py"]:
+              s = importlib.util.spec_from_file_location("m", f)
+              m = importlib.util.module_from_spec(s)
+              s.loader.exec_module(m)
+              print("import OK:", f)
+          PY
+
+      - name: 离线自检 (verify_digest.py, 占位符下 FAIL/跳过为预期)
+        run: python verify_digest.py
