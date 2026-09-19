@@ -350,7 +350,7 @@ def load_channels():
     by_id = data.get("by_id", {})
     chans = [(cid, info.get("name", ""), info.get("group", ""), info.get("no", ""))
              for cid, info in by_id.items()]
-    group_order = {"央视": 0, "卫视": 1, "特色": 2, "浙江本地": 3}
+    group_order = {"央视": 0, "卫视": 1, "特色": 2, "专题剧场": 3, "卡通": 4, "轮播": 5}
     def _key(c):
         no = int(c[3]) if str(c[3]).isdigit() else 999
         return (group_order.get(c[2], 99), no)

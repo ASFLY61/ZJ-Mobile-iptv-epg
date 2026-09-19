@@ -51,7 +51,7 @@
 - **只需 STBID**:UserID 与密码全自动从 `STBRegister` 解出。
 - **回看模式(默认)**:今天全天 + 过去 6 天全天 + 明天全天(复刻盒子回看界面)。
 - **live 模式**:今天(自当前节目起)+ 明天。
-- **批量导出**:一次登录拉全部 119 频道,导出 JSON / CSV / Excel。
+- **批量导出**:一次登录拉全部 222 频道,导出 JSON / CSV / Excel。
 - **端口自动探测**:VSP 端口在 7176–7200 间轮换,自动找通。
 
 ---
@@ -87,10 +87,10 @@ python full_local_login.py 2026-09-19                  # 只给日期, 频道默
 python full_local_login.py 7194 42329207 2026-09-19   # 端口 + 频道 + 日期
 python full_local_login.py live 42329858               # live 模式(今天现在起+明天)
 python full_local_login.py 42329858 week               # 周回看: 今天+过去6天, 共7天
-python full_local_login.py all 2026-09-19              # 全部119频道某一天, 导出 CSV/Excel
+python full_local_login.py all 2026-09-19              # 全部222频道某一天, 导出 CSV/Excel
 ```
 
-- 端口可省略(自动探测 7176–7200);`42329858`=中央一套、`42329916`=黑龙江卫视、`42329207`=陕西卫视,完整 119 台见 `channel_ids.json`。
+- 端口可省略(自动探测 7176–7200);`42329858`=中央一套、`42329916`=黑龙江卫视、`42329207`=陕西卫视,完整 222 台见 `channel_ids.json`(含 mediaID,可用于取播放地址);当天实测有节目单的 174 台见 `epg_channels.json`。
 - **`week` = 周回看**:一次登录、循环拉"今天 + 过去 6 天"共 7 天,每天各存一份文件。
 - 每次运行按 `频道_日期` 命名,输出到仓库目录:`playbill_<频道>_<日期>.json` / `.txt`;批量另出 `playbill_all_<日期>.json` / `.csv` / `.xlsx`(CSV 用 UTF-8 BOM,双击 Excel 直接不乱码)。
 
@@ -104,7 +104,8 @@ python full_local_login.py all 2026-09-19              # 全部119频道某一�
 ├── verify_digest.py         # 离线自检: 复算 Digest 中间值 + 解密码(不发网络请求)
 ├── probe_days.py            # 诊断: 实测两种模式的日期范围(需联网)
 ├── extract_base.py          # 从抓包文件自动提取 BASE / VSP_HOST(零依赖)
-├── channel_ids.json         # 119 频道表(换区域替换此文件)
+├── channel_ids.json         # 222 频道表(含 mediaID; 换区域替换此文件)
+├── epg_channels.json        # 174 频道: 当天实测有节目数据的子集(查节目单用, 结构同 channel_ids.json)
 ├── requirements.txt         # 依赖: pycryptodome + openpyxl(均可选)
 ├── 安装依赖.bat             # 首次: 建 .venv + 装依赖
 ├── 运行纯本地登录.bat        # 双击运行主程序
