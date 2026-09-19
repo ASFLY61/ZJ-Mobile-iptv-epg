@@ -1,0 +1,12 @@
+# 统一换行符, 避免 Windows 下 .bat 双击失效
+* text=auto
+
+# Windows 批处理必须 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Python / 文档 / 数据: 统一 LF 即可
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.txt text eol=lf

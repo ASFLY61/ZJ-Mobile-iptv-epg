@@ -1,0 +1,8 @@
+# 纯本地方案依赖 (Python 3.8+)
+# 两个包都是"可选增强": 不装也能跑, 但功能受限(见下)。
+#
+# pycryptodome  -> 自动解密 STBRegister 里的 <Password> (AES-128-ECB)。
+#                  不装: 回退用代码里写死的兜底密码 PASSWORD, 换盒子时可能失效。
+# openpyxl      -> 批量导出 .xlsx。不装: 只导出 .csv (CSV 双击 Excel 也能开)。
+pycryptodome>=3.15
+openpyxl>=3.1

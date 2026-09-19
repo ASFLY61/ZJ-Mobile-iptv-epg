@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# 虚拟环境(由 安装依赖.bat 生成, 不入库)
+.venv/
+venv/
+env/
+
+# 运行输出的节目单(按需生成, 不入库)
+playbill_*.json
+playbill_*.txt
+playbill_*.csv
+playbill_*.xlsx
+
+# 抓包文件(含真实地址/凭据, 绝不入公开仓库)
+*.pcap
+*.pcapng
+*.har
+*.cap
+*.sharksession
+*.flow
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.swp
