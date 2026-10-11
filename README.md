@@ -22,7 +22,7 @@
 
 ## 快速开始
 
-**前提**:一台能访问目标 VSP 服务器的 Windows PC + Python 3.8+。
+**前提**:一台能访问目标 VSP 服务器的电脑(Windows 或 Linux)+ Python 3.8+。
 
 ```bat
 :: ① 首次: 双击 安装依赖.bat   ->  建 .venv, 装 pycryptodome + openpyxl (均可选)
@@ -35,6 +35,27 @@ python full_local_login.py
 ```
 
 > 首次运行会**提示填入 STBID**(EDS 已内置,一般不用改),填入后自动存到 `local_config.json`,后续直接跑。
+
+---
+
+## Linux 运行
+
+纯 Python 跨平台,无需 `.bat`,直接跑。**一键启动(自动建 venv + 装依赖):**
+```bash
+./run.sh                        # 默认: 中央一套 + 今天(回看)
+./run.sh 42329858 2026-09-19    # 频道 + 日期
+./run.sh all 2026-09-19          # 全部频道
+```
+
+**手动(不用 run.sh):**
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install pycryptodome openpyxl     # 均可选: 解密码 / 导 Excel
+python full_local_login.py            # 首次提示填 STBID
+```
+
+> 定时任务: 先交互跑一次存好 STBID,再 `crontab -e` 加一行
+> `0 6 * * * cd /path/to/repo && .venv/bin/python full_local_login.py all >> epg.log 2>&1`
 
 ---
 
@@ -114,8 +135,9 @@ response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
 ├── extract_base.py          # 从抓包文件自动提取 BASE / VSP_HOST(零依赖)
 ├── channel_ids.json         # 222 频道表(换区域替换此文件)
 ├── epg_channels.json        # 174 频道: 当天实测有节目数据的子集
-├── 安装依赖.bat / 运行纯本地登录.bat
-├── docs/                    # 技术文档(中/英)
+├── 安装依赖.bat / 运行纯本地登录.bat   # Windows 双击启动
+├── run.sh                   # Linux 一键启动(自动 venv + 装依赖)
+├── docs/                    # 技术文档
 └── reverse-engineering/     # 反编译源码(算法依据, 仅研究用)
 ```
 

@@ -5,8 +5,9 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 
-# Python / 文档 / 数据: 统一 LF 即可
+# Python / 文档 / 数据 / Shell: 统一 LF 即可
 *.py text eol=lf
 *.md text eol=lf
 *.json text eol=lf
 *.txt text eol=lf
+*.sh text eol=lf
