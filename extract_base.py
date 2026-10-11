@@ -1,22 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-extract_base.py — 从抓包文件自动提取 BASE (EDS 入口) 和 VSP_HOST
+"""从抓包文件自动提取 BASE (EDS 入口) 和 VSP_HOST。
 
-支持格式: HAR(.har) / PCAP(.pcap, .pcapng) / 代理文本日志(Charles/Fiddler/HTTP Toolkit/mitmproxy 导出)
-          / 任何包含 URL 的文件。统一按文本扫描, 无需额外依赖。
+支持 HAR / PCAP / 代理文本日志 / 任何含 URL 的文件 (统一按文本扫描, 无额外依赖)。
+BASE = /EDS/ 请求的 host:port; VSP_HOST = /EPG/XML/ 或 /VSP/ URL 的 host (含 307 重定向)。
 
-原理:
-  - BASE    = 认证入口(EDS)。抓包里所有 /EDS/ 路径请求的 host:port 就是它
-              (盒子登录第一步 POST /EDS/STBRegister)。
-  - VSP_HOST = 业务服务器。/EPG/XML/ 或 /VSP/ 路径的 URL(含 307 重定向 Location)
-              的 host 就是它。
-
-用法:
-    python extract_base.py <抓包文件>
-    python extract_base.py capture.har
-    python extract_base.py capture.pcap
-    python extract_base.py proxy.log
+用法: python extract_base.py <抓包文件>
 """
 import re
 import sys

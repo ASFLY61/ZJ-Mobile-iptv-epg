@@ -15,6 +15,9 @@ playbill_*.txt
 playbill_*.csv
 playbill_*.xlsx
 
+# 双击交互填入的本地配置(含你的 STBID/EDS 等, 绝不入公开仓库)
+local_config.json
+
 # 抓包文件(含真实地址/凭据, 绝不入公开仓库)
 *.pcap
 *.pcapng

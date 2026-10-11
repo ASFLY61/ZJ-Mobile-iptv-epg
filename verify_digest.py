@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Digest 中间值 + STBRegister 密码解密 可复现验证 (纯本地, 无需网络)
-[模板] 下面是占位符。填入你自己盒子"一次真实运行"的值后, 运行本脚本即可
-       逐步复算 HA1 / MD5(body) / HA2 / 密码解密, 并和你抓到的期望值比对。
-       留占位符时各比对会显示 FAIL / 跳过 —— 这是预期行为, 填了真实值才应全 OK。
-运行: python verify_digest.py
+"""Digest 中间值 + STBRegister 密码解密 可复现验证 (纯本地, 无需网络)。
+
+[模板] 填入你自己盒子"一次真实运行"的值, 本脚本逐步复算
+HA1 / MD5(body) / HA2 / 密码解密并与期望值比对。
+留占位符时比对显示 FAIL / 跳过 (预期); 填真实值后应全 OK。
 """
 import hashlib, base64
 
@@ -14,8 +14,7 @@ USERNAME = "YOUR_USERNAME_HERE"
 PASSWORD = "YOUR_PASSWORD_HERE"
 
 # ===== STBRegister 密码解密 (AES-128-ECB, 密钥来自固件 libdataprocessing.so) =====
-# ★ 已内置默认值: 同型号/区域所有盒子通用 (固件 libdataprocessing.so 偏移 0x7004)。
-#   同区域盒子直接用; 换型号/区域才改。
+# 默认值同区域盒子通用 (libdataprocessing.so 偏移 0x7004); 换型号/区域才改。
 AES_KEY = bytes.fromhex("6b4050eb4f2c6a3398665c245ec53640")
 # 你盒子 STBRegister 响应里的 <Password> (base64, URL 编码) 及其解码/十六进制
 STBREG_PW_URL  = "YOUR_BASE64_URL_ENCODED_CIPHERTEXT"

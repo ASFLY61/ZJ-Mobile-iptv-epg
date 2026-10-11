@@ -1,85 +1,178 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-完整本地登录 (不依赖 EPG 登录 / Frida)
-======================================
-只需: STBID  (设备序列号, adb shell getprop ro.serialno)
-  - UserID  自动从 STBRegister 响应 <UserID> 读取
-  - 密码    自动从 STBRegister 响应 <Password> 解密 (AES-128-ECB, key 见 AES_KEY)
-  - VSP端口 自动探测 (7176-7200)
-换盒子只改 STBID 一个值即可。
+"""完整本地登录 (不依赖 EPG 登录 / Frida)。
 
-流程:
-  1. STBRegister       (POST /EDS/STBRegister, 307 跟随) -> UserID + 加密Password
-  2. Digest challenge  (POST /EDS/pub/authentication_initial_challenge_v1, 空body)
-  3. Digest auth       (POST /EDS/pub/authentication_initial, 带 Authorization) -> UserToken
-  4. ZJLogin           (POST /VSP/V3/ZJLogin, 不带任何自定义头) -> JSESSIONID + 新UserToken
-                        (端口自动探测: 扫 7176-7200 找 retCode=000000000 的端口)
-  5. QueryPlaybill     (POST /VSP/V3/QueryPlaybillListStcProps) -> 节目单
+只需 STBID: UserID/密码自动从 STBRegister 响应读取/解密, VSP 端口自动探测。
+换盒子只改 STBID。算法与解密细节见 README。
 
-节目单两种模式 (QueryPlaybill.type 字段, 反编译 catchup/TVOD*Presenter):
-  catchup (默认, type=2 + isFillProgram=1 + sortType=STARTTIME:ASC):
-     复刻盒子"回看" —— 今天全天 + 过去6天全天; 第7天起早期缺失, 第8天起无数据
-  live (type=1):
-     今天(自当前节目起) + 明天; 无历史
+流程: STBRegister -> Digest challenge -> Digest auth -> ZJLogin -> QueryPlaybill
 
-算法 (反编译 AuthManagerImpl.java:434-471 精确还原):
-  HA1 = MD5(username:realm:BASE64(password))
-  HA2 = MD5("POST:/EDS/pub/authentication_initial:" + MD5(body))
-  response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
-  nc=00000001, cnonce=MD5(随机), body=<AuthenticationRequest><STBID>..</STBID></AuthenticationRequest>
-
-密码解密 (DataProcessing.decryptAes, libdataprocessing.so):
-  AES-128-ECB + PKCS7, key = YOUR_AES_KEY (.so 偏移 0x7004)
-
-运行(你 PC 上, 能访问 YOUR_VSP_IP):
-  python full_local_login.py [频道ID] [日期] [VSP端口hint]   # 参数顺序无关, 按类型识别
-  例: python full_local_login.py 42329858 2026-09-19          # 默认回看(全天+过去6天)
-  全部频道: python full_local_login.py all 2026-09-19
-  live 模式(今天现在起+明天): python full_local_login.py live 42329858
-  周回看(今天+过去6天, 共7天, 逐天拉): python full_local_login.py 42329858 week
+用法 (参数顺序无关):
+  python full_local_login.py [频道ID] [日期] [VSP端口hint]
+  python full_local_login.py all 2026-09-19     # 全部频道
+  python full_local_login.py live 42329858       # live 模式 (今天现在起+明天)
+  python full_local_login.py 42329858 week       # 周回看 (今天+过去6天)
 """
 import os, csv, hashlib, base64, secrets, json, sys, re, urllib.request, urllib.error
 from datetime import datetime, timezone, timedelta
 
-# ===================== 使用前必须填你自己的值 =====================
-# 下面是占位符, 请替换成你自己盒子/区域的值 (获取方法见 README「配置说明」)。
-# 填好 STBID 后, USERNAME/PASSWORD 通常可留占位符 —— 它们会自动从 STBRegister 解出。
+# 强制 stdout/stderr 用 UTF-8, 避免 GBK 控制台打印 ✓ 崩溃
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
-# [每盒必改] 机顶盒序列号: 机顶盒背面标签, 或 adb shell getprop ro.serialno
+# ===================== 只需填 STBID (EDS 已内置, 其余自动; 详见 README) =====================
+# [每盒必改] 机顶盒序列号 (盒子背面标签, 或 adb getprop ro.serialno)
 STBID = "YOUR_STBID_HERE"
-# [兜底, 可留占位符] 设备密码(明文) —— 正常会自动解密 STBRegister 的 <Password> 得到;
-#        仅当自动解密失败(缺 pycryptodome / 响应异常)时才用这个值
+# [兜底] 设备密码(明文), 正常自动从 STBRegister 解密
 PASSWORD = "YOUR_PASSWORD_HERE"
-# [兜底, 可留占位符] 订购用户 ID —— 自动从 STBRegister 的 <UserID> 读取
+# [兜底] 订购用户 ID, 正常自动从 STBRegister 读取
 USERNAME = "YOUR_USERNAME_HERE"
-# STBRegister <Password> 字段的 AES-128-ECB 密钥 (PKCS7 填充), 16 字节十六进制。
-#   ★ 已内置默认值: 同型号/区域的所有盒子通用 (来自固件 libdataprocessing.so 偏移 0x7004)。
-#   同区域盒子直接用即可, 无需修改; 仅当换了不同型号/区域的盒子才需要改。
+# STBRegister <Password> 的 AES-128-ECB 密钥, 同区域盒子通用, 通常不用改
 AES_KEY = bytes.fromhex("6b4050eb4f2c6a3398665c245ec53640")
-# [换区域才改] 认证入口(EDS)地址, 形如 http://<域名>:8082
-#   这是整套认证的第一步入口。两种获取方式(任选其一):
-#     (A) 盒子配置: EPG 应用 config.json 里的 "edsUrl" 字段
-#         adb shell cat /data/data/com.pukka.ydepg/shared_prefs/*.xml  或抓包
-#     (B) 抓包: 用盒子登录一次, 抓到的第一个请求就是
-#         POST http://<EDS域名>:8082/EDS/STBRegister  —— 取它的 host:port
-#   例: http://<你的EDS域名>:8082   (具体域名以你盒子 config.json 的 edsUrl 为准)
-BASE = "http://YOUR_EDS_HOST:PORT"
-# [可留占位符] VSP 业务服务器 IP —— 承载 /VSP/V3/ZJLogin、/VSP/V3/QueryPlaybill 等。
-#   ★ 通常不用手填: 程序会用 BASE 发 STBRegister, 服务器 307 重定向到
-#     http://<VSP_HOST>:<端口>/EPG/XML/STBRegister, 程序自动从该地址取出 VSP_HOST。
-#   若要手填, 来源同 BASE:
-#     (A) 抓包看 STBRegister 的 307 响应头 Location 里的 IP;
-#     (B) 盒子 config.json 里对应的 VSP 地址。
+# 认证入口(EDS), 已内置默认值(浙江移动, 同区域通用); 若登录失败(区域/运营商不同)再改
+BASE = "http://zj-mobile-hwzw-rznew.wasu.tv:8082"
+# [可留占位符] VSP 服务器 IP, 通常自动从 STBRegister 307 重定向推导
 VSP_HOST = "YOUR_VSP_IP"
-# [换区域才改] 频道表: 默认用本目录的 channel_ids.json (已随包附带); 换区域替换该文件即可
+# [换区域才改] 频道表, 默认本目录 channel_ids.json
 _HERE = os.path.dirname(os.path.abspath(__file__))
 CHANNELS_JSON = os.path.join(_HERE, "channel_ids.json")
 # ===================== 以下通用, 不用改 =====================
 CST = timezone(timedelta(hours=8))
-OUT_DIR = _HERE   # 节目单输出到脚本所在目录
+OUT_DIR = _HERE
 
 UA = {"User-Agent": "Huawei-EPG-APK"}
+
+# 交互填入的配置保存文件 (双击提示后自动写入, 下次不再提示)
+CONFIG_FILE = os.path.join(_HERE, "local_config.json")
+
+
+def _is_placeholder(v):
+    """v 为空或含 YOUR_* 占位符 (还没填真实值)。"""
+    if v is None:
+        return True
+    s = str(v).strip()
+    return (s == "") or ("YOUR_" in s.upper())
+
+
+def _load_saved_config():
+    """读 local_config.json, 不存在/损坏返回 {} (utf-8-sig 兼容 BOM)。"""
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_config(vals):
+    """把填入的配置合并写入 local_config.json。"""
+    try:
+        cur = _load_saved_config()
+        cur.update(vals)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cur, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print("[!] 保存配置失败:", e)
+        return False
+
+
+def ensure_config():
+    """双击入口: 确保必填配置齐全。
+    优先读 local_config.json; 仍占位且交互终端则提示填入并保存; 非交互缺必填则报错。"""
+    global STBID, PASSWORD, USERNAME, BASE, VSP_HOST
+
+    # 载入上次保存的配置
+    saved = _load_saved_config()
+    if saved.get("STBID"):
+        STBID = saved["STBID"]
+    if saved.get("PASSWORD"):
+        PASSWORD = saved["PASSWORD"]
+    if saved.get("USERNAME"):
+        USERNAME = saved["USERNAME"]
+    if saved.get("BASE"):
+        BASE = saved["BASE"]
+    if saved.get("VSP_HOST"):
+        VSP_HOST = saved["VSP_HOST"]
+
+    # 必填项 (STBID / BASE) 齐全则直接放行
+    if not (_is_placeholder(STBID) or _is_placeholder(BASE)):
+        return
+
+    # 非交互模式无法输入 -> 报错
+    if not sys.stdin.isatty():
+        print("[!] 缺少必填配置 (STBID), 且当前非交互模式无法提示输入。")
+        print("    请双击 运行纯本地登录.bat 交互填入, 或手动编辑本文件顶部占位符。")
+        sys.exit(1)
+
+    # 交互提示 (输入中断/无 stdin/Ctrl+C 都优雅退出)
+    print()
+    print("=" * 62)
+    print("  纯本地登录 - 配置你的盒子信息")
+    print("  必填项不能为空; 可选项直接回车=跳过, 程序会自动获取")
+    print("=" * 62)
+    entered = {}
+    try:
+        if _is_placeholder(STBID):
+            while True:
+                v = input("[必填] STBID 机顶盒序列号: ").strip()
+                if v:
+                    entered["STBID"] = v
+                    break
+                print("    !! 不能为空, 请重新输入")
+
+        if _is_placeholder(BASE):
+            while True:
+                v = input("[必填] EDS 认证入口 (形如 http://域名:8082): ").strip()
+                if v:
+                    if not v.lower().startswith("http"):
+                        v = "http://" + v
+                    entered["BASE"] = v
+                    break
+                print("    !! 不能为空, 请重新输入")
+
+        if _is_placeholder(VSP_HOST):
+            v = input("[可选] VSP 服务器 IP (回车=自动探测): ").strip()
+            if v:
+                entered["VSP_HOST"] = v
+
+        if _is_placeholder(PASSWORD):
+            v = input("[可选] 设备密码明文 (回车=自动解密): ").strip()
+            if v:
+                entered["PASSWORD"] = v
+
+        if _is_placeholder(USERNAME):
+            v = input("[可选] 订购用户ID (回车=自动读取): ").strip()
+            if v:
+                entered["USERNAME"] = v
+    except EOFError:
+        print("\n[!] 输入中断 (stdin 无输入), 无法交互配置。")
+        print("    请双击 运行纯本地登录.bat 在窗口中填入, 或手动编辑本文件顶部占位符。")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n[!] 已取消。")
+        sys.exit(1)
+
+    # 应用 + 保存
+    if "STBID" in entered:
+        STBID = entered["STBID"]
+    if "BASE" in entered:
+        BASE = entered["BASE"]
+    if "VSP_HOST" in entered:
+        VSP_HOST = entered["VSP_HOST"]
+    if "PASSWORD" in entered:
+        PASSWORD = entered["PASSWORD"]
+    if "USERNAME" in entered:
+        USERNAME = entered["USERNAME"]
+    if entered:
+        if _save_config(entered):
+            print("[✓] 已保存到 local_config.json (下次双击无需重填)")
+    print("[✓] 配置完成, 开始登录...")
+    print()
 
 
 def _raw_post(url, data, headers, no_ua=False):
@@ -87,8 +180,7 @@ def _raw_post(url, data, headers, no_ua=False):
     if headers:
         h.update(headers)
     if no_ua:
-        # 抑制 urllib 默认 User-Agent (盒子 ZJLogin 零头)
-        h["User-Agent"] = ""
+        h["User-Agent"] = ""   # 抑制 urllib 默认 UA (盒子 ZJLogin 零头)
     req = urllib.request.Request(url, data=data, method="POST", headers=h)
     try:
         with urllib.request.urlopen(req, timeout=25) as r:
@@ -98,8 +190,7 @@ def _raw_post(url, data, headers, no_ua=False):
 
 
 def post(url, data=b"", headers=None, no_ua=False):
-    """POST, 手动跟随 307/302 重定向 (POST 保留 body), 返回 (status, headers, body, final_url)
-    no_ua=True 时不注入全局 UA (ZJLogin 用)"""
+    """POST, 手动跟随 307/302 重定向 (保留 body), 返回 (status, headers, body, final_url)。"""
     cur = url
     for _ in range(5):
         code, hdrs, body = _raw_post(cur, data, headers, no_ua)
@@ -114,8 +205,7 @@ def post(url, data=b"", headers=None, no_ua=False):
 
 
 def decrypt_password(b64ct):
-    """解密 STBRegister 的 <Password> 字段: AES-128-ECB + PKCS7, key=AES_KEY。
-    失败返回 None (调用方回退到全局 PASSWORD)。"""
+    """解密 STBRegister 的 <Password>: AES-128-ECB + PKCS7, key=AES_KEY; 失败返回 None。"""
     try:
         try:
             from Crypto.Cipher import AES
@@ -135,7 +225,7 @@ def decrypt_password(b64ct):
 
 
 def _host_from_url(url):
-    """从 URL 取 hostname (失败返回 None)"""
+    """从 URL 取 hostname (失败返回 None)。"""
     try:
         from urllib.parse import urlparse
         return urlparse(url).hostname
@@ -144,9 +234,8 @@ def _host_from_url(url):
 
 
 def stb_register():
-    """第0步: STBRegister 注册 STB, 返回 (success, userid, password, final_url)。
-    userid 从 <UserID> 读, password 从 <Password> 解密 —— 换盒子只需 STBID。
-    final_url = 307 重定向后的地址, 其主机即 VSP_HOST (可用来自动推导)。"""
+    """STBRegister 注册, 返回 (success, userid, password, final_url)。
+    userid/password 自动从响应读取/解密; final_url 主机即 VSP_HOST。"""
     url = BASE + "/EDS/STBRegister"
     body = f"<STBRegisterReq><STBID>{STBID}</STBID></STBRegisterReq>".encode()
     print(f"[*] STBRegister -> {url}")
@@ -171,7 +260,7 @@ def stb_register():
 
 
 def get_challenge():
-    """第1步: 拿 Digest challenge (realm/nonce/opaque/algorithm/qop)"""
+    """拿 Digest challenge (realm/nonce/opaque/algorithm/qop)。"""
     url = BASE + "/EDS/pub/authentication_initial_challenge_v1"
     print(f"[*] challenge -> {url}")
     code, hdrs, body, final = post(url, b"", {"Content-Type": "text/plain; charset=UTF-8"})
@@ -182,7 +271,6 @@ def get_challenge():
         print("    body:", body.decode("utf-8", "replace")[:300])
         raise SystemExit("[!] 没拿到 WWW-Authenticate challenge")
     print(f"    WWW-Authenticate: {www}")
-    # 解析 "Digest realm=..,nonce=..,opaque=..,algorithm=..,qop=.."
     www = www.split(" ", 1)[1] if www.lower().startswith("digest") else www
     fields = {}
     for part in www.split(","):
@@ -197,7 +285,7 @@ def md5(s):
 
 
 def digest_auth(ch, username=None, password=None):
-    """第2步: Digest 鉴权, 拿 UserToken。username/password 默认全局值, 可被 STBRegister 返回值覆盖"""
+    """Digest 鉴权, 拿 UserToken。username/password 默认全局值, 可被 STBRegister 覆盖。"""
     username = username or USERNAME
     password = password or PASSWORD
     realm = ch.get("realm", "")
@@ -205,14 +293,13 @@ def digest_auth(ch, username=None, password=None):
     opaque = ch.get("opaque", "")
     algorithm = ch.get("algorithm", "MD5")
     qop = ch.get("qop", "")
-    # 精确 body (Frida 调 getPostInfo 实抓, 注意 ?> 前有空格):
+    # 精确 body (Frida 实抓, 注意 ?> 前有空格)
     body = ("<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>"
             f"<AuthenticationRequest><STBID>{STBID}</STBID></AuthenticationRequest>").encode()
 
     ha1 = md5(f"{username}:{realm}:{base64.b64encode(password.encode()).decode()}")
     ha2 = md5(f"POST:/EDS/pub/authentication_initial:{md5(body.decode())}")
-    # countCN(1): Long.toHexString(1)="1", length=8-1=7, 循环 i2<=7 共8次 -> "00000000"+"1"
-    nc = "000000001"
+    nc = "000000001"   # countCN(1) -> "00000000"+"1"
     cnonce = md5(str(secrets.randbelow(2**31)))
     if qop:
         response = md5(f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}")
@@ -235,7 +322,7 @@ def digest_auth(ch, username=None, password=None):
     sc_val = sc.group(1).strip() if sc else "?"
     if sc:
         print(f"    StatusCode={sc_val}")
-    # 从 final URL 提取当前 edsUrl 端口 (307 重定向目标, 即 ZJLogin 该用的端口)
+    # 从 final URL 提取当前 edsUrl 端口 (ZJLogin 该用的端口)
     final_port = None
     pm = re.search(r"://112\.15\.228\.65:(\d+)", final)
     if pm:
@@ -246,13 +333,11 @@ def digest_auth(ch, username=None, password=None):
 
 
 def zjlogin(usertoken, port):
-    """第3步: ZJLogin 建会话, 拿 JSESSIONID + 新 userToken
-    关键: 不带任何自定义头 (Frida 实抓 REQ-HEADERS 为空), 端口用当前 edsUrl 端口
-    返回 (jsid, new_usertoken)"""
+    """ZJLogin 建会话, 拿 JSESSIONID + 新 userToken。
+    关键: 不带任何自定义头 (与盒子一致), 端口用当前 edsUrl 端口。"""
     url = f"http://{VSP_HOST}:{port}/VSP/V3/ZJLogin"
     print(f"[*] ZJLogin -> {url}")
     body = json.dumps({"userToken": usertoken}).encode()
-    # 不带任何自定义头 (UA/Content-Type 都不带, 与盒子一致)
     code, hdrs, body2, final = post(url, body, {}, no_ua=True)
     print(f"    HTTP {code}")
     text = body2.decode("utf-8", "replace")
@@ -278,8 +363,7 @@ def zjlogin(usertoken, port):
 
 
 def find_working_port(usertoken, hint):
-    """端口自动探测: 先试 hint, 失败则扫 7176-7200 找 ZJLogin 返回 000000000 的端口
-    返回 (port, jsid, new_token); 找不到返回 (None, None, None)"""
+    """端口探测: 先试 hint, 失败扫 7176-7200 找 ZJLogin 返回 000000000 的端口。"""
     candidates = [hint] + [str(p) for p in range(7176, 7201) if str(p) != hint]
     for p in candidates:
         try:
@@ -294,7 +378,7 @@ def find_working_port(usertoken, hint):
 
 
 def fmt_ts(ms):
-    """毫秒时间戳 -> HH:MM (CST)"""
+    """毫秒时间戳 -> HH:MM (CST)。"""
     try:
         return datetime.fromtimestamp(int(ms) / 1000, CST).strftime("%H:%M")
     except Exception:
@@ -302,7 +386,7 @@ def fmt_ts(ms):
 
 
 def parse_playbill(data):
-    """解析节目单响应 -> 节目列表(按开始时间升序), 每项 {start,end,name,id}"""
+    """解析节目单 -> 节目列表(按开始时间升序), 每项 {start,end,name,id}。"""
     progs = []
     for cp in data.get("channelPlaybills", []):
         for p in cp.get("playbillLites", []):
@@ -321,7 +405,7 @@ def parse_playbill(data):
 
 
 def save_playbill(progs, channel_id, day, retcode):
-    """把完整节目列表存为 JSON + 可读文本, 返回 (json_path, txt_path)"""
+    """存为 JSON + 可读文本, 返回 (json_path, txt_path)。"""
     base = os.path.join(OUT_DIR, f"playbill_{channel_id}_{day}")
     payload = {
         "channel_id": channel_id,
@@ -344,7 +428,7 @@ def save_playbill(progs, channel_id, day, retcode):
 
 
 def load_channels():
-    """读频道表 -> [(channel_id, name, group, no), ...] 按 分组/频道号 排序"""
+    """读频道表 -> [(channel_id, name, group, no), ...] 按 分组/频道号 排序。"""
     with open(CHANNELS_JSON, encoding="utf-8") as f:
         data = json.load(f)
     by_id = data.get("by_id", {})
@@ -359,7 +443,7 @@ def load_channels():
 
 
 def channel_info(channel_id):
-    """从 channel_ids.json 查频道信息 {name, group, mediaID, no}; 找不到返回 {}"""
+    """查频道信息 {name, group, mediaID, no}; 找不到返回 {}。"""
     try:
         with open(CHANNELS_JSON, encoding="utf-8") as f:
             data = json.load(f)
@@ -369,10 +453,7 @@ def channel_info(channel_id):
 
 
 def resolve_channel_id(user_input):
-    """把用户输入解析成 (channelID, info)。
-    - 输入是 channelID (by_id 的 key) -> 直接用
-    - 输入是 mediaID (某频道的 mediaID 字段) -> 映射回对应 channelID
-    返回 (channel_id, info_dict)"""
+    """把输入解析成 (channelID, info): 支持 channelID 或 mediaID。"""
     s = str(user_input)
     info = channel_info(s)
     if info:
@@ -398,7 +479,7 @@ def _row(r):
 
 
 def export_csv(rows, path):
-    """导出 CSV (UTF-8 BOM, Excel 双击直接打开不乱码)"""
+    """导出 CSV (UTF-8 BOM, Excel 直接打开不乱码)。"""
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(CSV_HEADERS)
@@ -408,7 +489,7 @@ def export_csv(rows, path):
 
 
 def export_xlsx(rows, path):
-    """导出 .xlsx (需 openpyxl; 不可用返回 None)"""
+    """导出 .xlsx (需 openpyxl; 不可用返回 None)。"""
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Font
@@ -431,10 +512,8 @@ def export_xlsx(rows, path):
 
 def query_playbill(jsid, usertoken, port, channel_id, day,
                    mode="catchup", start_ms=None, end_ms=None):
-    """第4步: 查节目单。
-    mode="catchup" 回看(type=2): 今天全天 + 过去6天全天 (复刻盒子回看, 默认)
-    mode="live"    普通(type=1): 今天现在起 + 明天
-    start_ms/end_ms 可覆盖默认全天窗口 [00:00, 23:59:59]。"""
+    """查节目单。catchup=回看(今天全天+过去6天), live=今天现在起+明天。
+    start_ms/end_ms 可覆盖默认全天窗口。"""
     if mode == "catchup":
         qp_type, is_fill, sort = "2", "1", "STARTTIME:ASC"
     else:  # live
@@ -469,8 +548,118 @@ def query_playbill(jsid, usertoken, port, channel_id, day,
     return code, body2
 
 
+def catchup_url(jsid, usertoken, port, channel_id, media_id, playbill_id):
+    """回看地址: PlayChannel businessType=CUTV + playbillID -> /TVOD/ URL。返回 (retCode, url)。"""
+    url = f"http://{VSP_HOST}:{port}/VSP/V3/PlayChannel"
+    body = {"URLFormat": "1", "businessType": "CUTV",
+            "channelID": str(channel_id), "mediaID": str(media_id), "playbillID": str(playbill_id)}
+    headers = {
+        "Cookie": f"JSESSIONID={jsid}",
+        "Set-Cookie": f"JSESSIONID={jsid}; Path=/VSP/",
+        "authorization": usertoken,
+        "Content-Type": "application/json; charset=UTF-8",
+        "Host": f"{VSP_HOST}:{port}",
+    }
+    code, hdrs, body2, final = post(url, json.dumps(body).encode(), headers)
+    try:
+        data = json.loads(body2.decode("utf-8", "replace"))
+    except Exception:
+        return "ERR", None
+    rc = data.get("result", {}).get("retCode")
+    if rc == "000000000":
+        return rc, (data.get("attachedPlayURL") or data.get("playURL"))
+    return rc, None
+
+
+def run_catchup_list(jsid, token, port, channel_id, day):
+    """列出某频道某天所有节目(带 playbillID), 供选回看。"""
+    cid, info = resolve_channel_id(channel_id)
+    cname = info.get("name", channel_id)
+    code, body2 = query_playbill(jsid, token, port, cid, day, mode="catchup")
+    data = json.loads(body2.decode("utf-8", "replace"))
+    lites = data.get("channelPlaybills", [{}])[0].get("playbillLites", [])
+    lites.sort(key=lambda p: int(p.get("startTime", 0) or 0))
+    print("\n" + "=" * 64)
+    print(f" 回看列表  频道={cname} (channelID={cid})  日期={day}  共{len(lites)}条")
+    print(" 取回看地址: python full_local_login.py catchup <channelID> <playbillID>")
+    print("=" * 64)
+    for i, p in enumerate(lites, 1):
+        st = int(p.get("startTime", 0) or 0)
+        en = int(p.get("endTime", 0) or 0)
+        print(f"{i:3d}. [{p.get('ID','')}] {fmt_ts(st)} - {fmt_ts(en)}  {p.get('name','')}")
+
+
+def run_catchup_play(jsid, token, port, channel_id, playbill_id):
+    """取某节目的回看地址 (TVOD URL)。"""
+    cid, info = resolve_channel_id(channel_id)
+    cname = info.get("name", channel_id)
+    media_id = info.get("mediaID", "")
+    print(f"\n[*] 回看 -> channelID={cid} mediaID={media_id} playbillID={playbill_id}")
+    rc, url = catchup_url(jsid, token, port, cid, media_id, playbill_id)
+    print("\n" + "=" * 64)
+    print(f" 回看地址  频道={cname}  playbillID={playbill_id}")
+    print("=" * 64)
+    if rc == "000000000" and url:
+        print("  [✓] TVOD 回看地址 (可直接喂播放器):")
+        print("  " + url)
+        ps = re.search(r"playseek=([^&]+)", url)
+        if ps:
+            s, e = ps.group(1).split("-")
+            print(f"  [时间窗] {s[:8]} {s[8:10]}:{s[10:12]}:{s[12:14]} - {e[8:10]}:{e[10:12]}:{e[12:14]}")
+    else:
+        print(f"  [!] 失败 retCode={rc} (节目可能不在回看窗口内, 或 channelID/mediaID 不对)")
+
+
+def run_catchup_batch(jsid, token, port, channel_id, day):
+    """批量: 某频道某天所有已播节目, 逐个取回看地址, 存 JSON + M3U。"""
+    cid, info = resolve_channel_id(channel_id)
+    cname = info.get("name", channel_id)
+    media_id = info.get("mediaID", "")
+    code, body2 = query_playbill(jsid, token, port, cid, day, mode="catchup")
+    data = json.loads(body2.decode("utf-8", "replace"))
+    lites = data.get("channelPlaybills", [{}])[0].get("playbillLites", [])
+    lites.sort(key=lambda p: int(p.get("startTime", 0) or 0))
+    print(f"\n[*] 批量回看: {cname} ({cid}) {day}  共 {len(lites)} 节目, 逐个取地址...")
+    results = []
+    ok = fail = 0
+    for i, p in enumerate(lites, 1):
+        pid = p.get("ID", "")
+        st = int(p.get("startTime", 0) or 0)
+        en = int(p.get("endTime", 0) or 0)
+        name = p.get("name", "")
+        rc, url = catchup_url(jsid, token, port, cid, media_id, pid)
+        dur = max(0, (en - st) // 1000)
+        results.append({"playbillID": pid, "name": name,
+                        "start": fmt_ts(st), "end": fmt_ts(en),
+                        "duration": dur, "url": url if rc == "000000000" else None})
+        if rc == "000000000" and url:
+            ok += 1
+        else:
+            fail += 1
+        if i % 5 == 0 or i == len(lites):
+            print(f"  [{i}/{len(lites)}] {name[:22]} -> {'OK' if url else 'FAIL'}")
+    jp = os.path.join(OUT_DIR, f"catchup_{cid}_{day}.json")
+    with open(jp, "w", encoding="utf-8") as f:
+        json.dump({"channelID": cid, "channel": cname, "date": day,
+                   "generated_at": datetime.now(CST).strftime("%Y-%m-%d %H:%M:%S"),
+                   "ok": ok, "fail": fail, "programs": results}, f, ensure_ascii=False, indent=1)
+    mu = ["#EXTM3U"]
+    for r in results:
+        if r["url"]:
+            mu.append(f'#EXTINF:{r["duration"]},{r["name"]} ({r["start"]}-{r["end"]})')
+            mu.append(r["url"])
+    mp = os.path.join(OUT_DIR, f"catchup_{cid}_{day}.m3u8")
+    with open(mp, "w", encoding="utf-8") as f:
+        f.write("\n".join(mu) + "\n")
+    print("\n" + "=" * 64)
+    print(f" 批量回看完成: 成功 {ok} / 失败 {fail} / 共 {len(lites)}")
+    print(f"  JSON: {jp}")
+    print(f"  M3U : {mp}   (可直接喂播放器, 逐条看历史节目; 地址有时效, 尽快用)")
+    print("=" * 64)
+
+
 def day_note(progs, mode="catchup"):
-    """若该日节目未从 00:00 开始, 打印原因说明"""
+    """若该日节目未从 00:00 开始, 打印原因说明。"""
     if progs and progs[0]["start"] > "00:00":
         if mode == "catchup":
             print(f"\n[提示] 该日未从 00:00 开始(首条 {progs[0]['start']}) —— 超过 6 天的回看, 早期节目已过期。")
@@ -481,7 +670,7 @@ def day_note(progs, mode="catchup"):
 
 
 def run_single(jsid, token, port, channel_id, day, mode="catchup"):
-    """单频道: 打印完整列表 + 存 JSON/文本 (频道显示真实名称, 支持 mediaID 输入)"""
+    """单频道: 打印完整列表 + 存 JSON/文本。"""
     cid, info = resolve_channel_id(channel_id)
     cname = info.get("name", channel_id)
     cmedia = info.get("mediaID", "")
@@ -511,7 +700,7 @@ def run_single(jsid, token, port, channel_id, day, mode="catchup"):
 
 
 def run_batch(jsid, token, port, day, mode="catchup"):
-    """全部频道: 复用同一会话逐个拉, 汇总导出 JSON/CSV/XLSX"""
+    """全部频道: 复用同一会话逐个拉, 汇总导出 JSON/CSV/XLSX。"""
     chans = load_channels()
     print(f"\n[*] 批量拉取全部 {len(chans)} 个频道 [{mode}] ...")
     all_rows, per_channel = [], {}
@@ -559,9 +748,7 @@ def run_batch(jsid, token, port, day, mode="catchup"):
 
 
 def run_week(jsid, token, port, channel_id, channel_all, mode="catchup"):
-    """周回看: 今天 + 过去6天, 共7天, 复用同一会话逐天拉取。
-    单频道 -> 每天存 playbill_<频道>_<日期>.json/.txt
-    全频道 -> 每天存 playbill_all_<日期>.json/.csv/.xlsx"""
+    """周回看: 今天+过去6天, 共7天, 逐天拉取。"""
     today = datetime.now(CST).date()
     days = [(today + timedelta(days=off)).strftime("%Y-%m-%d") for off in range(0, -7, -1)]
     print(f"\n[*] 周回看: 今天 + 过去6天, 共 {len(days)} 天 (mode={mode})")
@@ -573,45 +760,48 @@ def run_week(jsid, token, port, channel_id, channel_all, mode="catchup"):
 
 
 def parse_args(argv):
-    """类型识别、顺序无关地解析参数:
-    - "all"            -> 全部频道
-    - "live"           -> live 模式(type=1, 今天现在起+明天); 默认 catchup 回看
-    - "week"           -> 周回看: 今天+过去6天, 共7天(逐天拉, 忽略单独日期)
-    - 4位且 7176-7200  -> 端口 hint
-    - YYYY-MM-DD       -> 日期
-    - 其它纯数字        -> 频道 ID
-    返回 (port, channel_id, day, channel_all, mode, week)"""
+    """类型识别、顺序无关地解析参数, 返回
+    (port, channel_id, day, channel_all, mode, week, is_catchup, playbill_id, is_catchup_batch)。
+    关键字: all/live/week/catchup/urls; 4位7176-7200=端口; YYYY-MM-DD=日期; 其它数字=频道ID。"""
     channel_all = "all" in argv
     week = "week" in argv
+    is_catchup = "catchup" in argv
+    is_catchup_batch = "urls" in argv
     mode = "live" if "live" in argv else "catchup"
-    port = channel_id = day = None
+    port = channel_id = day = playbill_id = None
     for a in argv:
-        if a in ("all", "live", "week"):
+        if a in ("all", "live", "week", "catchup", "urls"):
             continue
         if re.fullmatch(r"\d{4}", a) and 7176 <= int(a) <= 7200:
             port = a
         elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", a):
             day = a
         elif re.fullmatch(r"\d+", a):
-            channel_id = a
+            if channel_id is None:
+                channel_id = a
+            elif is_catchup and not is_catchup_batch:
+                playbill_id = a
     if port is None:
         port = "7182"
     if channel_id is None:
         channel_id = "all" if channel_all else "42329858"
     if day is None:
         day = datetime.now(CST).strftime("%Y-%m-%d")
-    return port, channel_id, day, channel_all, mode, week
+    return port, channel_id, day, channel_all, mode, week, is_catchup, playbill_id, is_catchup_batch
 
 
 def main():
-    port, channel_id, day, channel_all, mode, week = parse_args(sys.argv[1:])
+    ensure_config()   # 双击入口: 先提示填入所需变量, 再执行登录
+    port, channel_id, day, channel_all, mode, week, is_catchup, playbill_id, is_catchup_batch = parse_args(sys.argv[1:])
 
     print("=" * 60)
     print(" 完整本地登录 (只需 STBID, 无需 EPG/Frida)"
           + ("  [全部频道]" if channel_all else "") + f"  [{mode} 模式]"
-          + ("  [周回看7天]" if week else ""))
+          + ("  [周回看7天]" if week else "")
+          + ("  [回看]" if is_catchup else "")
+          + ("  [批量回看]" if is_catchup_batch else ""))
     print("=" * 60)
-    # 20244 = 注册过期, 需 STBRegister 后立刻 Digest, 失败重试 (盒子同款逻辑)
+    # 20244 = 注册过期, 需 STBRegister 后立刻 Digest, 失败重试
     usertoken = None
     final_port = None
     userid = None
@@ -635,7 +825,7 @@ def main():
         print(f"[✓] UserID (STBRegister 自动读取) = {userid}")
     print(f"[✓] Password (STBRegister 自动解密) = {password or '(解密失败, 用兜底 ' + PASSWORD + ')'}")
     print(f"[✓] UserToken = {usertoken}")
-    # 若 VSP_HOST 仍是占位符, 从 STBRegister 的 307 重定向地址自动推导 (只需填 BASE)
+    # VSP_HOST 占位时, 从 STBRegister 307 重定向自动推导
     global VSP_HOST
     if VSP_HOST in ("", "YOUR_VSP_IP"):
         derived = _host_from_url(reg_final or "")
@@ -645,7 +835,7 @@ def main():
             print(f"[✓] VSP_HOST 自动推导 (来自 STBRegister 307 重定向) = {VSP_HOST}")
         else:
             print(f"[!] 无法自动推导 VSP_HOST (307 未跳转到新主机), 请手动填写 VSP_HOST")
-    # 优先用 Digest 307 重定向的端口 (即当前 edsUrl 端口), 否则用命令行 hint
+    # 优先用 Digest 307 重定向的端口, 否则用命令行 hint
     hint = final_port if final_port else port
     print(f"[*] 开始端口探测 (hint={hint}, 来自 Digest 重定向={final_port})...")
     port, jsid, new_token = find_working_port(usertoken, hint)
@@ -655,7 +845,14 @@ def main():
     if not jsid:
         print("[!] 所有端口 ZJLogin 都失败 (看上方响应)")
         return
-    if week:
+    if is_catchup:
+        if is_catchup_batch:
+            run_catchup_batch(jsid, new_token, port, channel_id, day)
+        elif playbill_id:
+            run_catchup_play(jsid, new_token, port, channel_id, playbill_id)
+        else:
+            run_catchup_list(jsid, new_token, port, channel_id, day)
+    elif week:
         run_week(jsid, new_token, port, channel_id, channel_all, mode)
     elif channel_all:
         run_batch(jsid, new_token, port, day, mode)
